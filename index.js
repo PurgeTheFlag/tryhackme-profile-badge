@@ -1,1711 +1,311 @@
-const puppeteer = require('puppeteer-extra');
-const StealthPlugin = require('puppeteer-extra-plugin-stealth');
-
-puppeteer.use(StealthPlugin());
-
-const https = require('https');
+const puppeteer = require('puppeteer');
 const fs = require('fs');
 const path = require('path');
-const { URLSearchParams } = require('url');
 
-
-// ============================================================
-// CONFIGURATION
-// ============================================================
-
-// Your TryHackMe badge ID
 const BADGE_URL = 'https://tryhackme.com/badge/2437045';
+const OUTPUT_PATH = path.join(__dirname, 'assets', 'uploadme.png');
+const SCRAPER_API_KEY = process.env.SCRAPER_API_KEY || '';
 
-// Your TryHackMe profile
-const PROFILE_URL = 'https://tryhackme.com/p/PurgeTheFlag';
+const DEBUG = process.env.DEBUG === '1' || process.env.DEBUG === 'true';
+function debugLog(...args) { if (DEBUG) console.log('[DEBUG]', ...args); }
+function debugFile(name, content) {
+  if (!DEBUG) return;
+  const dir = path.join(__dirname, 'debug');
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  const fp = path.join(dir, name);
+  fs.writeFileSync(fp, typeof content === 'string' ? content : JSON.stringify(content, null, 2));
+  console.log(`[DEBUG] Saved ${fp} (${content.length || 0} bytes)`);
+}
 
-// Generated badge image
-const OUTPUT_PATH = path.join(
-  __dirname,
-  'assets',
-  'uploadme.png'
-);
+// ─── Fetch via ScraperAPI (or direct if no key) ───────────────────────
+function fetchViaScraperAPI(url) {
+  return new Promise((resolve, reject) => {
+    const http = require('http');
+    const https = require('https');
 
+    if (!SCRAPER_API_KEY) {
+      // Direct fetch with browser-like headers
+      const req = https.get(url, {
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36',
+          'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+          'Accept-Language': 'en-US,en;q=0.9',
+          'Accept-Encoding': 'gzip, deflate, br',
+          'Connection': 'keep-alive',
+          'Upgrade-Insecure-Requests': '1',
+        },
+      }, (res) => {
+        const chunks = [];
+        res.on('data', chunk => chunks.push(chunk));
+        res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+      }).on('error', reject);
+      return;
+    }
 
-// ============================================================
-// SCRAPERAPI CONFIGURATION
-// ============================================================
-
-// DO NOT put the actual API key here.
-//
-// GitHub secret must be named:
-//
-// SCRAPERAPI_KEY
-//
-const SCRAPERAPI_KEY =
-  process.env.SCRAPERAPI_KEY || '';
-
-const USE_SCRAPERAPI =
-  SCRAPERAPI_KEY.length > 0;
-
-
-// ============================================================
-// SCRAPERAPI URL BUILDER
-// ============================================================
-
-function buildScraperAPIUrl(
-  targetUrl,
-  options = {}
-) {
-  if (!USE_SCRAPERAPI) {
-    return targetUrl;
-  }
-
-  const params = new URLSearchParams({
-    api_key: SCRAPERAPI_KEY,
-
-    url: targetUrl,
-
-    render:
-      options.render !== undefined
-        ? String(options.render)
-        : 'true',
-
-    country_code:
-      options.country_code || 'us',
-
-    premium:
-      options.premium !== undefined
-        ? String(options.premium)
-        : 'true',
-
-    retry_404: 'false',
-
-    session_number: String(
-      options.session ||
-        Math.floor(
-          Math.random() * 10000
-        )
-    ),
-
-    keep_headers: 'true',
-
-    wait_for_selector:
-      options.waitFor || '',
+    console.log(`Fetching via ScraperAPI (render=true)...`);
+    const scraperUrl = `http://api.scraperapi.com?api_key=${SCRAPER_API_KEY}&url=${encodeURIComponent(url)}&render=true`;
+    http.get(scraperUrl, (res) => {
+      const chunks = [];
+      res.on('data', chunk => chunks.push(chunk));
+      res.on('end', () => resolve(Buffer.concat(chunks).toString()));
+    }).on('error', reject);
   });
-
-  // Remove empty query parameters
-  for (const [key, value] of params.entries()) {
-    if (value === '') {
-      params.delete(key);
-    }
-  }
-
-  return (
-    'https://api.scraperapi.com/?' +
-    params.toString()
-  );
 }
 
-
-// ============================================================
-// FETCH USING SCRAPERAPI
-// ============================================================
-
-async function fetchWithScraperAPI(
-  url,
-  options = {}
-) {
-  if (!USE_SCRAPERAPI) {
-    throw new Error(
-      'SCRAPERAPI_KEY not set'
-    );
+// ─── Launch options for Puppeteer ─────────────────────────────────────
+function getLaunchOptions() {
+  const { execSync } = require('child_process');
+  let chromiumPath;
+  try { chromiumPath = execSync('which chromium-browser', { encoding: 'utf8' }).trim(); } catch {}
+  if (!chromiumPath) {
+    try { chromiumPath = execSync('which chromium', { encoding: 'utf8' }).trim(); } catch {}
+  }
+  if (!chromiumPath) {
+    try { chromiumPath = execSync('which google-chrome', { encoding: 'utf8' }).trim(); } catch {}
+  }
+  if (!chromiumPath) {
+    try { chromiumPath = execSync('which google-chrome-stable', { encoding: 'utf8' }).trim(); } catch {}
   }
 
-  const scraperUrl =
-    buildScraperAPIUrl(
-      url,
-      options
-    );
+  const launchArgs = [
+    '--no-sandbox',
+    '--disable-setuid-sandbox',
+    '--disable-blink-features=AutomationControlled',
+    '--disable-features=VizDisplayCompositor',
+    '--no-first-run',
+    '--no-default-browser-check',
+    '--disable-web-security',
+    '--disable-features=IsolateOrigins,site-per-process'
+  ];
+  const launchOpts = { args: launchArgs, headless: 'new', ignoreDefaultArgs: ['--enable-automation'] };
 
-  console.log(
-    `Fetching via ScraperAPI: ${url}`
-  );
-
-  // Do NOT print the whole ScraperAPI URL,
-  // because that would expose the API key.
-  console.log(
-    'ScraperAPI request prepared'
-  );
-
-  return new Promise(
-    (resolve, reject) => {
-      const timeout =
-        setTimeout(
-          () => {
-            reject(
-              new Error(
-                'ScraperAPI timeout'
-              )
-            );
-          },
-          90000
-        );
-
-      https
-        .get(
-          scraperUrl,
-          res => {
-            let data = '';
-
-            res.on(
-              'data',
-              chunk => {
-                data += chunk;
-              }
-            );
-
-            res.on(
-              'end',
-              () => {
-                clearTimeout(timeout);
-
-                console.log(
-                  `ScraperAPI response: HTTP ${res.statusCode}, length: ${data.length}`
-                );
-
-                if (
-                  res.statusCode >= 200 &&
-                  res.statusCode < 300
-                ) {
-                  resolve(data);
-                } else {
-                  console.log(
-                    'ScraperAPI error preview:',
-                    data.substring(
-                      0,
-                      500
-                    )
-                  );
-
-                  reject(
-                    new Error(
-                      `ScraperAPI HTTP ${res.statusCode}`
-                    )
-                  );
-                }
-              }
-            );
-          }
-        )
-        .on(
-          'error',
-          error => {
-            clearTimeout(timeout);
-            reject(error);
-          }
-        );
-    }
-  );
-}
-
-
-// ============================================================
-// DECODE TRYHACKME BADGE RESPONSE
-// ============================================================
-
-function decodeBadgeHTML(html) {
-  if (!html) {
-    return '';
-  }
-
-  /*
-   * TryHackMe may return something like:
-   *
-   * document.write(window.atob("BASE64..."))
-   *
-   * The actual badge HTML is inside the
-   * Base64 string.
-   */
-
-  const match = html.match(
-    /document\.write\s*\(\s*window\.atob\s*\(\s*["']([^"']+)["']\s*\)\s*\)/i
-  );
-
-  if (!match) {
-    console.log(
-      'No Base64 wrapper found; using raw HTML'
-    );
-
-    return html;
-  }
-
-  try {
-    const decoded =
-      Buffer.from(
-        match[1],
-        'base64'
-      ).toString('utf8');
-
-    console.log(
-      `Decoded badge HTML length: ${decoded.length}`
-    );
-
-    return decoded;
-  } catch (error) {
-    console.log(
-      'Failed to decode badge HTML:',
-      error.message
-    );
-
-    return html;
-  }
-}
-
-
-// ============================================================
-// FETCH BADGE HTML
-// ============================================================
-
-async function fetchBadgeHTML() {
-  console.log(
-    'Fetching badge...'
-  );
-
-  /*
-   * First try ScraperAPI.
-   *
-   * IMPORTANT:
-   * Decode the response BEFORE checking
-   * for "thm_badge".
-   *
-   * This fixes the problem from your
-   * GitHub Actions log.
-   */
-
-  if (USE_SCRAPERAPI) {
-    try {
-      const html =
-        await fetchWithScraperAPI(
-          BADGE_URL,
-          {
-            render: 'true',
-            premium: 'true',
-          }
-        );
-
-      const decoded =
-        decodeBadgeHTML(html);
-
-      const isVercelChallenge =
-        decoded.includes(
-          'Vercel Security Checkpoint'
-        );
-
-      const hasBadge =
-        decoded.includes(
-          'thm_badge'
-        );
-
-      if (
-        !isVercelChallenge &&
-        hasBadge
-      ) {
-        console.log(
-          'Badge fetched successfully via ScraperAPI'
-        );
-
-        return decoded;
-      }
-
-      console.log(
-        'ScraperAPI response did not contain a usable badge'
-      );
-    } catch (error) {
-      console.log(
-        'ScraperAPI badge fetch failed:',
-        error.message
-      );
-    }
+  if (chromiumPath) {
+    launchOpts.executablePath = chromiumPath;
+    console.log(`Using system Chromium: ${chromiumPath}`);
   } else {
-    console.log(
-      'SCRAPERAPI_KEY not found'
-    );
+    console.log('No system Chromium found — using Puppeteer bundled Chromium');
   }
 
-  console.log(
-    'Falling back to Puppeteer for badge...'
-  );
-
-  return fetchBadgeHTMLPuppeteer();
+  return launchOpts;
 }
 
+// ─── Badge HTML fetch via Puppeteer ───────────────────────────────────
+async function fetchBadgeHTML() {
+  const rawHtml = await fetchViaScraperAPI(BADGE_URL);
+  debugFile('badge-raw.html', rawHtml);
 
-// ============================================================
-// BROWSER
-// ============================================================
+  // Check for Vercel challenge (should not happen with ScraperAPI render=true)
+  if (rawHtml.includes('Vercel Security Checkpoint') || rawHtml.includes('Just a moment')) {
+    throw new Error('Got Vercel challenge page — ScraperAPI may have failed');
+  }
 
-async function launchBrowser() {
-  return puppeteer.launch({
-    args: [
-      '--no-sandbox',
-      '--disable-setuid-sandbox',
-      '--disable-blink-features=AutomationControlled',
-      '--disable-features=VizDisplayCompositor',
-      '--no-first-run',
-      '--no-default-browser-check',
-    ],
+  // TryHackMe badge page returns base64-encoded HTML: document.write(window.atob("..."))
+  const atobMatch = rawHtml.match(/document\.write\(window\.atob\("([^"]+)"\)\)/);
+  if (atobMatch) {
+    const decoded = Buffer.from(atobMatch[1], 'base64').toString('utf-8');
+    debugLog('Decoded badge HTML:', decoded.length, 'bytes');
+    debugFile('badge-decoded.html', decoded);
+    return decoded;
+  }
 
-    executablePath:
-      '/usr/bin/chromium',
+  // Maybe the HTML is not encoded but still contains the badge
+  if (rawHtml.includes('thm_badge') || rawHtml.includes('thm_nickname')) {
+    debugLog('Badge HTML not encoded, using raw');
+    return rawHtml;
+  }
 
-    headless: 'new',
-
-    ignoreDefaultArgs: [
-      '--enable-automation',
-    ],
-  });
+  console.warn('Could not decode badge HTML via atob');
+  console.warn('First 500 chars:', rawHtml.substring(0, 500));
+  debugFile('badge-decode-failure.html', rawHtml);
+  throw new Error('Badge page did not contain expected content');
 }
 
-
-// ============================================================
-// CONFIGURE PUPPETEER PAGE
-// ============================================================
-
-async function configurePage(page) {
-  await page.setViewport({
-    width: 1366,
-    height: 768,
-  });
-
-  await page.setUserAgent(
-    'Mozilla/5.0 (X11; Linux x86_64) ' +
-      'AppleWebKit/537.36 (KHTML, like Gecko) ' +
-      'Chrome/120.0.0.0 Safari/537.36'
-  );
-
-  await page.setExtraHTTPHeaders({
-    Accept:
-      'text/html,application/xhtml+xml,' +
-      'application/xml;q=0.9,' +
-      'image/avif,image/webp,image/apng,' +
-      '*/*;q=0.8',
-
-    'Accept-Language':
-      'en-US,en;q=0.9',
-
-    'Cache-Control':
-      'no-cache',
-
-    Pragma:
-      'no-cache',
-
-    'Upgrade-Insecure-Requests':
-      '1',
-  });
-}
-
-
-// ============================================================
-// FETCH BADGE USING PUPPETEER
-// ============================================================
-
-async function fetchBadgeHTMLPuppeteer() {
-  console.log(
-    'Launching stealth browser to fetch badge...'
-  );
-
-  const browser =
-    await launchBrowser();
-
-  const page =
-    await browser.newPage();
-
-  try {
-    await configurePage(page);
-
-    for (
-      let attempt = 1;
-      attempt <= 2;
-      attempt++
-    ) {
-      try {
-        console.log(
-          `Badge navigation attempt ${attempt}`
-        );
-
-        await page.goto(
-          BADGE_URL,
-          {
-            waitUntil:
-              'domcontentloaded',
-
-            timeout:
-              120000,
-          }
-        );
-
-        break;
-      } catch (error) {
-        console.log(
-          `Navigation attempt ${attempt} failed:`,
-          error.message
-        );
-
-        if (attempt === 2) {
-          throw error;
-        }
-
-        await sleep(
-          10000 * attempt
-        );
-      }
-    }
-
-    console.log(
-      'Waiting for badge content...'
-    );
-
-    try {
-      await page.waitForFunction(
-        () => {
-          const html =
-            document.documentElement
-              .innerHTML;
-
-          return (
-            html.includes(
-              'thm_badge'
-            ) &&
-            !html.includes(
-              'Vercel Security Checkpoint'
-            )
-          );
-        },
-        {
-          timeout: 60000,
-        }
-      );
-    } catch {
-      console.log(
-        'Badge wait timed out'
-      );
-    }
-
-    await sleep(3000);
-
-    const html =
-      await page.content();
-
-    console.log(
-      'Browser badge HTML length:',
-      html.length
-    );
-
-    if (
-      html.includes(
-        'Vercel Security Checkpoint'
-      )
-    ) {
-      throw new Error(
-        'TryHackMe returned Vercel Security Checkpoint'
-      );
-    }
-
-    return decodeBadgeHTML(
-      html
-    );
-  } finally {
-    await browser.close();
-  }
-}
-
-
-// ============================================================
-// STREAK EXTRACTION
-// ============================================================
-
-function extractStreakFromHTML(html) {
-  if (!html) {
-    return null;
+// ─── Stats extraction from badge HTML ───────────────────────────────
+function extractStatsFromBadgeHTML(html) {
+  // Pattern 1: <span class="thm_stat...">value</span>
+  let statsMatches = [...html.matchAll(/<span class="thm_stat[^"]*">([^<]+)<\/span>/g)];
+  if (statsMatches.length >= 3) {
+    debugLog('Stats via thm_stat:', statsMatches.map(m => m[1]));
+    return statsMatches.map(m => m[1]);
   }
 
-  /*
-   * First try normal visible text.
-   */
-  const visiblePatterns = [
-    /Streak\s*[:\-]?\s*(\d+)/i,
-    /Current\s+Streak\s*[:\-]?\s*(\d+)/i,
-  ];
-
-  for (
-    const pattern
-    of visiblePatterns
-  ) {
-    const match =
-      html.match(pattern);
-
-    if (match) {
-      return match[1];
-    }
+  // Pattern 2: <span class="details-text">value</span>
+  statsMatches = [...html.matchAll(/<span class="details-text">([^<]+)<\/span>/g)];
+  if (statsMatches.length >= 3) {
+    debugLog('Stats via details-text:', statsMatches.map(m => m[1]));
+    return statsMatches.map(m => m[1]);
   }
 
-  /*
-   * Try common JSON / application-state
-   * formats used by React pages.
-   */
-  const jsonPatterns = [
-    /"streak"\s*:\s*(\d+)/i,
-    /"currentStreak"\s*:\s*(\d+)/i,
-    /"current_streak"\s*:\s*(\d+)/i,
-    /&quot;streak&quot;\s*:\s*(\d+)/i,
-    /&quot;currentStreak&quot;\s*:\s*(\d+)/i,
-  ];
-
-  for (
-    const pattern
-    of jsonPatterns
-  ) {
-    const match =
-      html.match(pattern);
-
-    if (match) {
-      return match[1];
-    }
+  // Pattern 3: Any three consecutive numbers in spans
+  const allNums = [...html.matchAll(/<span[^>]*>\s*(\d[\d,]*)\s*<\/span>/g)].map(m => m[1].replace(/,/g, ''));
+  if (allNums.length >= 3) {
+    debugLog('Stats via all spans:', allNums.slice(0, 5));
+    return allNums.slice(0, 3);
   }
 
-  return null;
-}
-
-
-// ============================================================
-// FETCH STREAK
-// ============================================================
-
-async function fetchStreak() {
-  console.log(
-    'Fetching streak...'
-  );
-
-  if (USE_SCRAPERAPI) {
-    try {
-      const html =
-        await fetchWithScraperAPI(
-          PROFILE_URL,
-          {
-            render: 'true',
-            premium: 'true',
-          }
-        );
-
-      if (
-        !html.includes(
-          'Vercel Security Checkpoint'
-        )
-      ) {
-        const streak =
-          extractStreakFromHTML(
-            html
-          );
-
-        if (streak !== null) {
-          console.log(
-            'Extracted streak via ScraperAPI:',
-            streak
-          );
-
-          return streak;
-        }
-
-        /*
-         * IMPORTANT FIX:
-         *
-         * Original code returned "0"
-         * immediately here.
-         *
-         * Now, if ScraperAPI did not find
-         * the streak, we try Puppeteer.
-         */
-        console.log(
-          'Could not extract streak from ScraperAPI response; trying browser fallback'
-        );
-      } else {
-        console.log(
-          'ScraperAPI profile returned Vercel challenge'
-        );
-      }
-    } catch (error) {
-      console.log(
-        'ScraperAPI streak fetch failed:',
-        error.message
-      );
-    }
-  }
-
-  return fetchStreakPuppeteer();
-}
-
-
-// ============================================================
-// FETCH STREAK USING PUPPETEER
-// ============================================================
-
-async function fetchStreakPuppeteer() {
-  console.log(
-    'Launching browser to fetch streak...'
-  );
-
-  const browser =
-    await launchBrowser();
-
-  const page =
-    await browser.newPage();
-
-  try {
-    await configurePage(page);
-
-    await page.goto(
-      PROFILE_URL,
-      {
-        waitUntil:
-          'domcontentloaded',
-
-        timeout:
-          120000,
-      }
-    );
-
-    /*
-     * Give React / client-side content
-     * some time to render.
-     */
-    try {
-      await page.waitForFunction(
-        () => {
-          const text =
-            document.body
-              .innerText;
-
-          return (
-            text.includes(
-              'Streak'
-            ) ||
-            text.includes(
-              'PurgeTheFlag'
-            )
-          );
-        },
-        {
-          timeout:
-            60000,
-        }
-      );
-    } catch {
-      console.log(
-        'Profile content wait timed out'
-      );
-    }
-
-    await sleep(3000);
-
-    const html =
-      await page.content();
-
-    if (
-      html.includes(
-        'Vercel Security Checkpoint'
-      )
-    ) {
-      console.log(
-        'Profile blocked by Vercel'
-      );
-
-      return '0';
-    }
-
-    /*
-     * Try HTML extraction.
-     */
-    let streak =
-      extractStreakFromHTML(
-        html
-      );
-
-    /*
-     * If that fails, check visible
-     * browser text too.
-     */
-    if (streak === null) {
-      const text =
-        await page.evaluate(
-          () =>
-            document.body
-              .innerText
-        );
-
-      streak =
-        extractStreakFromHTML(
-          text
-        );
-    }
-
-    console.log(
-      'Extracted streak via browser:',
-      streak
-    );
-
-    return streak || '0';
-  } catch (error) {
-    console.log(
-      'Error fetching streak:',
-      error.message
-    );
-
-    return '0';
-  } finally {
-    try {
-      await browser.close();
-    } catch {
-      // Ignore close error
-    }
-  }
-}
-
-
-// ============================================================
-// EXTRACT BADGE STATISTICS
-// ============================================================
-
-function extractStats(
-  html,
-  streak
-) {
-  if (!html) {
-    throw new Error(
-      'Badge HTML is empty'
-    );
-  }
-
-  const nicknameMatch =
-    html.match(
-      /<span[^>]*class=["'][^"']*thm_nickname[^"']*["'][^>]*>([^<]+)<\/span>/i
-    );
-
-  const username =
-    nicknameMatch
-      ? nicknameMatch[1].trim()
-      : 'PurgeTheFlag';
-
-
-  const rankMatch =
-    html.match(
-      /<span[^>]*class=["'][^"']*thm_rank[^"']*["'][^>]*>([^<]+)<\/span>/i
-    );
-
-  const rankTitle =
-    rankMatch
-      ? rankMatch[1].trim()
-      : '';
-
-
-  // Avatar
-  let avatarUrl = null;
-
-  const avatarMatch =
-    html.match(
-      /class=["'][^"']*thm_avatar[^"']*["'][^>]*style=["'][^"']*background-image\s*:\s*url\(['"]?([^'")]+)['"]?\)/i
-    );
-
-  if (avatarMatch) {
-    avatarUrl =
-      avatarMatch[1];
-
-    if (
-      avatarUrl.startsWith(
-        'user-avatars/'
-      )
-    ) {
-      avatarUrl =
-        'https://tryhackme-images.s3.amazonaws.com/' +
-        avatarUrl;
-    }
-  }
-
-  if (!avatarUrl) {
-    const anyAvatarMatch =
-      html.match(
-        /user-avatars\/([^'")\s<>]+)/i
-      );
-
-    if (anyAvatarMatch) {
-      avatarUrl =
-        'https://tryhackme-images.s3.amazonaws.com/user-avatars/' +
-        anyAvatarMatch[1];
-    }
-  }
-
-
-  // Badge stats
-  const stats =
-    extractStatsFromBadgeHTML(
-      html
-    );
-
-  console.log(
-    'Raw badge stats:',
-    stats
-  );
-
-  if (stats.length < 3) {
-    console.log(
-      'Badge HTML preview:',
-      html.substring(
-        0,
-        1500
-      )
-    );
-
-    throw new Error(
-      `Expected at least 3 stats, found ${stats.length}`
-    );
-  }
-
-  /*
-   * Based on the original project:
-   *
-   * 1 = points
-   * 2 = rooms
-   * 3 = rank
-   */
-
-  const [
-    points,
-    rooms,
-    rank,
-  ] = stats;
-
-  return {
-    username,
-    rankTitle,
-    avatarUrl,
-    points,
-    streak:
-      streak || '0',
-    rank,
-    rooms,
-  };
-}
-
-
-// ============================================================
-// EXTRACT STATS FROM BADGE HTML
-// ============================================================
-
-function extractStatsFromBadgeHTML(
-  html
-) {
-  /*
-   * Method 1:
-   * original TryHackMe thm_stat spans
-   */
-
-  let matches = [
-    ...html.matchAll(
-      /<span[^>]*class=["'][^"']*thm_stat[^"']*["'][^>]*>([^<]+)<\/span>/gi
-    ),
-  ];
-
-  if (matches.length >= 3) {
-    return matches.map(
-      match =>
-        match[1].trim()
-    );
-  }
-
-
-  /*
-   * Method 2:
-   * details-text spans
-   */
-
-  matches = [
-    ...html.matchAll(
-      /<span[^>]*class=["'][^"']*details-text[^"']*["'][^>]*>([^<]+)<\/span>/gi
-    ),
-  ];
-
-  if (matches.length >= 3) {
-    return matches.map(
-      match =>
-        match[1].trim()
-    );
-  }
-
-
-  /*
-   * Method 3:
-   * Try specific icon-associated numbers
-   */
-
-  const trophyMatch =
-    html.match(
-      /trophy[\s\S]{0,300}?(\d[\d,]*)/i
-    );
-
-  const doorMatch =
-    html.match(
-      /door[\s\S]{0,300}?(\d[\d,]*)/i
-    );
-
-  const targetMatch =
-    html.match(
-      /target[\s\S]{0,300}?(\d[\d,]*)/i
-    );
-
-  if (
-    trophyMatch &&
-    doorMatch &&
-    targetMatch
-  ) {
-    return [
-      trophyMatch[1],
-      doorMatch[1],
-      targetMatch[1],
-    ];
-  }
-
-
-  /*
-   * Nothing worked.
-   */
-
+  debugLog('No stats found in HTML. First 1000 chars:', html.substring(0, 1000));
   return [];
 }
 
-
-// ============================================================
-// DOWNLOAD AVATAR
-// ============================================================
-
-async function downloadImageAsBase64(
-  url
-) {
-  if (!url) {
-    throw new Error(
-      'Avatar URL missing'
-    );
-  }
-
-  return new Promise(
-    (resolve, reject) => {
-      const request =
-        https.get(
-          url,
-          res => {
-            /*
-             * Handle redirects.
-             */
-            if (
-              res.statusCode >= 300 &&
-              res.statusCode < 400 &&
-              res.headers.location
-            ) {
-              res.resume();
-
-              downloadImageAsBase64(
-                res.headers.location
-              )
-                .then(resolve)
-                .catch(reject);
-
-              return;
-            }
-
-            if (
-              res.statusCode !== 200
-            ) {
-              reject(
-                new Error(
-                  `Failed to download image: HTTP ${res.statusCode}`
-                )
-              );
-
-              return;
-            }
-
-            const chunks = [];
-
-            res.on(
-              'data',
-              chunk => {
-                chunks.push(chunk);
-              }
-            );
-
-            res.on(
-              'end',
-              () => {
-                const buffer =
-                  Buffer.concat(
-                    chunks
-                  );
-
-                const mime =
-                  res.headers[
-                    'content-type'
-                  ] ||
-                  'image/png';
-
-                resolve(
-                  `data:${mime};base64,${buffer.toString('base64')}`
-                );
-              }
-            );
-          }
-        );
-
-      request.on(
-        'error',
-        reject
-      );
-
-      request.setTimeout(
-        30000,
-        () => {
-          request.destroy(
-            new Error(
-              'Avatar download timeout'
-            )
-          );
-        }
-      );
-    }
-  );
+// ─── Avatar download ────────────────────────────────────────────────
+async function downloadImageAsDataUri(url) {
+  return new Promise((resolve, reject) => {
+    const https = require('https');
+    https.get(url, (res) => {
+      if (res.statusCode !== 200) {
+        reject(new Error(`HTTP ${res.statusCode} for ${url}`));
+        return;
+      }
+      const data = [];
+      res.on('data', chunk => data.push(chunk));
+      res.on('end', () => {
+        const base64 = Buffer.concat(data).toString('base64');
+        const mime = res.headers['content-type'] || 'image/png';
+        resolve(`data:${mime};base64,${base64}`);
+      });
+    }).on('error', reject);
+  });
 }
 
-
-// ============================================================
-// BUILD BADGE HTML
-// ============================================================
-
+// ─── Badge HTML builder ─────────────────────────────────────────────
 async function buildHTML(stats) {
+  // 1. Download avatar from S3 (not behind Vercel)
   let avatarDataUri;
-
   try {
-    console.log(
-      'Downloading avatar...'
-    );
-
-    avatarDataUri =
-      await downloadImageAsBase64(
-        stats.avatarUrl
-      );
-  } catch (error) {
-    console.warn(
-      'Failed to download avatar; using placeholder:',
-      error.message
-    );
-
-    avatarDataUri =
-      'data:image/svg+xml;base64,' +
-      Buffer.from(`
-        <svg
-          xmlns="http://www.w3.org/2000/svg"
-          width="60"
-          height="60"
-          viewBox="0 0 60 60"
-        >
-          <circle
-            cx="30"
-            cy="30"
-            r="30"
-            fill="#333333"
-          />
-        </svg>
-      `).toString('base64');
+    avatarDataUri = await downloadImageAsDataUri(stats.avatarUrl);
+  } catch (err) {
+    console.warn('Avatar download failed, using fallback:', err.message);
+    avatarDataUri = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 60 60"%3E%3Ccircle cx="30" cy="30" r="30" fill="%23333"/%3E%3C/svg%3E';
   }
 
+  // 2. Load background SVG from local asset (committed to repo)
+  const bgSvgPath = path.join(__dirname, 'assets', 'thm_public_badge_bg.svg');
+  let bgDataUri;
+  try {
+    if (fs.existsSync(bgSvgPath)) {
+      const svgContent = fs.readFileSync(bgSvgPath, 'utf8');
+      bgDataUri = `data:image/svg+xml;base64,${Buffer.from(svgContent).toString('base64')}`;
+    } else {
+      throw new Error('SVG file not found');
+    }
+  } catch (err) {
+    console.warn('Background SVG load failed, using fallback:', err.message);
+    bgDataUri = 'data:image/svg+xml,%3Csvg xmlns="http://www.w3.org/2000/svg" width="329" height="88"%3E%3Crect width="329" height="88" fill="%23121212" rx="12"/%3E%3C/svg%3E';
+  }
 
-  return `
-<!DOCTYPE html>
+  // Load exact THM icon PNGs as data URIs (no external CDN needed)
+  const iconTrophyUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAAC10lEQVR42oxTXUhTYRh+v/N952xzus2cujl/1haSmEZlhQVeJBoUaXhRgdBNIHTTXVfRRdBNdV/QRdFFCV2EREFpgkqaRaupaek8buZs6OZfcz9nbuf0fgvyB4oO54XvO8/zvDzf856P9N2gegBoxjqEZYD/exJYHqxuxsUllQ2XSvedatSAGePxOBQ4HKCkUhBdDcPaog8suRkw5RJY8E+B2WwGSoXY/IyvN/TdDyyjwhHn/pbGJ4/uBWf9U1He/trNu3XJaBR+Li9BJBwBliaQQyR42Dn8keMVZda8C231jcGAf0xYiWkOJhmMobmpsMTIYYlB8m++OcY5oVAkzJho5FphNaZRJRFT3O5K0aCD23qJxDmZEJIt4C/53YBjnOOqsIqKklK4liUU6B/uf36gqfVizbfRd+bQ3PQSF1JKQRCwUMyogGuAUrvFWOIoPLO30ln+/sOEj2tpcy2ZDAZndaH5WVu5q9putVe6C4uKqaqqoCgJWI8uQEEeBYOOQlpjdr1E6dvhr7JPDj1GUw/4FOKqqt2ZDcg9Ab98FvfHki3ttbUH64sZFbMOJFGAkbGZhe7eT6OID6HBLiaAl4NsS0ZeVQOvpoG791XXfVXTyO49VUX8/F8m/IuDQ+PjOLHLuJcp2RQJO5PGBnIiEet487LTR4jAM4S+/s+BRDLVwbGd/KwDgoNjmL0+BRgefnAQOZ3J/m3ZBzPM4PhkaVGDTAYgLaEmB4FcdJCZ0kD4gaRV3GAjEZvoRGgtKXNbkhgi2gabzWoSKZznGOdkuajJanc4qsIcBtKT2vWW9it1ktEAll1WOHn6RDULaFc5xjlbBeTW0W0NBprazh33jowIG3gXTCYTEMZgHdeiTgc1Lpfa8+zpIPIa/mSwFtvWIGdaloUKpxPsNhtY8vPxzBlYWV6GcCQCM36/gPycbSGuJzY3G2nwvH7h+ec9lkTwiFuG/0uAAQACpyKt1/ib3gAAAABJRU5ErkJggg==';
+  const iconDoorUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABAAAAAQCAYAAAAf8/9hAAABYElEQVR42oRTPU6GQBAd/gKEhgQbY2JhY0LLCQyFna2lhYWJJ/AS5kssTEw8gAewsCGegHNIrBTIB8Iu687C4vIJH5uQt7sz8+bNAzTGGOB6PNOeOESwvtLbd3YjD6bcdAyi88vryDAMcBwHbNsGXdeBEAJN00Bd14DN3l6eJ2x/BB2IxCRJwHVdqKrqH8ZxLPLUpcsN7ZCkj/q+P4sYpzsEpkpAKQXP80QBylUxz3MRp4sKaE+Ac2On3QfvBQFdICDDCJgo3wwimpdlmTAT42RNgaZpk84fXyUcXT3AZ75dUcAD2AUJMLHj3RENjq93F2Dye4wTumAiGRRIt9mg4PDAh9OT49FEsk8BFsgRJJFEeb+XQCpQTVRxVcFkBF6k4hLB6MH2py/EWbGoLEshW2JRFBAEgcibJfgu+cE0IQxD8TNZljXKb9tWfA+oAPNmCcoK0vtNsvovczGpev4VYAAZAytXIbWINQAAAABJRU5ErkJggg==';
+  const iconTargetUri = 'data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAABgAAAAYCAMAAADXqc3KAAACLlBMVEWVAACbAACcAACjAACoAADhAQHiAQHkAQHlAQH////lAQHjAQGhAACVAADlAQHeAQGwAACVAADlAQGVAACYAADlAQHbAQG8AQGVAADlAQHhAQGmAACVAADlAQHXAQHBAQHkAgLlAgKVAADlAQHnCQnTAQHFAQGdAADnDg6VAADhDQ3lAQHOAQHKAQGVAAC0BwebBASbBgaVAADvQ0PtQkLwRkbpOzvRKSnDJib1Zmb2aGi2ICC4IyP5fX3zamrQNzfNNjboUlLVPj77iYn9lpb9mZn4e3vsWVnyaWnkTEzlTU35eXn6gID/pqbsVFTe2Nje2dne2trf1NTgx8fg3Nzh19fjtrbjurrkqKjk29vlqKjl19fl2NjmoqLmqanmubnnoaHopKTp3NzqsLDq0tLrjY3sdHTswMDt5OTt6OjvV1fwWVnwYmLwZGTwZmbwdXXwenrxWlrxXFzxXV3xsLDxuLjyXl7yeHjzX1/zYGDzbGzz6enz7e30YmL0dHT1ZGT1Zmb1Z2f1tLT1vLz2Zmb2Z2f34OD4aGj4aWn4zMz4zc346+v5amr5fHz6bGz6b2/6d3f6hIT7bm77eHj7wsL7w8P77u778vL8cHD8cnL8hob8jIz9enr9fX39f3/9ior9paX9u7v+gYH+l5f+vb3+wMD+xcX+09P/d3f/fX3/gID/h4f/kpL/lZX/mpr/nZ3/x8f/yMj/1dX/2dn/6Oj/9fX/9vb/+vr/+/v//PyPL9vPAAAAT3RSTlMAAAAAAAAAAAAACwwNDhESExQZHR1HSE1UWVpkant+g4yMkpabnJ+ipaenp66ws7O2wcfJysrL0tjc3N7f5ufo6erw9PT09fb2+Pj9/f3+mAThwgAAAaRJREFUGBkFwTFy00AYgNFvpV/WSrYlx4lJSnoqOE9qirQZTgENDdwoVWZyAiYVQ8BRlJUsZVe70vKeFAAAAAAAgBABWOV6pbGTdRMASgBI6npdao2142DMAiAAZX1R38xLRCXpj602IyBE1vt3X/yySlPm2X/OvqYMKCFm1eG2r4o5GLaZfutuvwXnEWJ9cWMO2dEFOEl+kR5vvk9HhHJXuzJ7sgB4H670WI/DJOSb67D/26G3FV1vJ3U5XP/MJ0Hrk3p0SxraFxRxbsfZat0LuQ5vkuCnJKKWJV2mUOgcIV+5cZVx0gIEu8FPySpHUHFu1juabQ10fUE3FFEhuDn6fk1sCkVsMk8/x9khOBdid57ufv/SWHVY5q4MziHYUW3Nn6vk/LWj3CXhyW/VaBGcvftYtnKWXwLMbVvpO+sQTs+Fr93RVwKE7jWvvXk+ZUI0m/tPhxfTSY4LsdzLfWsiQhya4uHD2abzHbKqsvhgmkEhLDxHF6r3ewB47Jp/DREBaKb+YPI8wzs3Hk0PIAD0/ZCXGyGcRtcCgFAAYK0BAAoA+A9ptOQPOkyFSAAAAABJRU5ErkJggg==';
+
+  // Inline CSS to avoid external requests
+  return `<!DOCTYPE html>
 <html>
 <head>
-  <meta charset="UTF-8">
-
-  <link
-    rel="stylesheet"
-    href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.0/css/all.min.css"
-  >
-
-  <link
-    rel="preconnect"
-    href="https://fonts.googleapis.com"
-  >
-
-  <link
-    rel="preconnect"
-    href="https://fonts.gstatic.com"
-    crossorigin
-  >
-
-  <link
-    href="https://fonts.googleapis.com/css2?family=Ubuntu:wght@400;500&display=swap"
-    rel="stylesheet"
-  >
-
   <style>
-
-    * {
-      box-sizing: border-box;
-    }
-
-    html,
-    body {
-      width: 329px;
-      height: 88px;
-      margin: 0;
-      padding: 0;
-      background: transparent;
-      overflow: hidden;
-    }
-
-    #thm-badge {
-      width: 327px;
-      height: 84px;
-
-      background-image:
-        url(
-          'https://tryhackme.com/img/thm_public_badge_bg.svg'
-        );
-
-      background-size: cover;
-      background-position: center;
-
-      display: flex;
-      align-items: center;
-
-      gap: 12px;
-
-      border-radius: 12px;
-    }
-
-    .thm-avatar-outer {
-      width: 64px;
-      height: 64px;
-
-      border-radius: 50%;
-
-      background:
-        linear-gradient(
-          to bottom left,
-          #a3ea2a,
-          #2e4463
-        );
-
-      padding: 2px;
-
-      margin-left: 10px;
-
-      display: flex;
-      align-items: center;
-      justify-content: center;
-
-      flex-shrink: 0;
-    }
-
-    .thm-avatar {
-      width: 60px;
-      height: 60px;
-
-      background-image:
-        url('${avatarDataUri}');
-
-      background-size: cover;
-      background-position: center;
-
-      border-radius: 50%;
-
-      background-color:
-        #121212;
-
-      box-shadow:
-        0 0 3px 0 #303030;
-    }
-
-    .badge-user-details {
-      display: flex;
-      flex-direction: column;
-
-      gap: 8px;
-    }
-
-    .title-wrapper {
-      display: flex;
-      align-items: center;
-
-      gap: 6px;
-    }
-
-    .user_name {
-      font-family:
-        'Ubuntu',
-        sans-serif;
-
-      font-weight: 500;
-      font-size: 14px;
-
-      color: #f9f9fb;
-
-      max-width: 135px;
-
-      white-space: nowrap;
-      overflow: hidden;
-      text-overflow: ellipsis;
-    }
-
-    .rank-icon {
-      color: #ffbb45;
-      font-size: 10px;
-    }
-
-    .rank-title {
-      font-family:
-        'Ubuntu',
-        sans-serif;
-
-      font-weight: 500;
-      font-size: 12px;
-
-      color: #ffffff;
-    }
-
-    .details-wrapper {
-      display: flex;
-      gap: 8px;
-    }
-
-    .details-icon-wrapper {
-      display: flex;
-      gap: 5px;
-
-      align-items: center;
-    }
-
-    .detail-icons {
-      font-weight: 900;
-      font-size: 11px;
-    }
-
-    .trophy-icon {
-      color: #9ca4b4;
-    }
-
-    .fire-icon {
-      color: #a3ea2a;
-      font-size: 13px;
-    }
-
-    .award-icon {
-      color: #d752ff;
-      font-size: 13px;
-    }
-
-    .door-closed-icon {
-      color: #719cf9;
-      font-size: 12px;
-    }
-
-    .details-text {
-      font-family:
-        'Ubuntu',
-        sans-serif;
-
-      font-weight: 400;
-      font-size: 11px;
-
-      color: #ffffff;
-    }
-
-    .thm-link {
-      font-family:
-        'Ubuntu',
-        sans-serif;
-
-      font-weight: 400;
-      font-size: 11px;
-
-      color: #f9f9fb;
-
-      text-decoration: none;
-    }
-
+    body { width: 329px; height: 88px; margin: 0; background: transparent; font-family: Ubuntu, sans-serif; }
+    #thm-badge { width: 327px; height: 84px; background-image: url('${bgDataUri}'); background-size: cover; display: flex; align-items: center; gap: 12px; border-radius: 12px; }
+    .thm-avatar-outer { width: 60px; height: 60px; border-radius: 50%; background: linear-gradient(to bottom left, #a3ea2a, #2e4463); padding: 2px; margin-left: 10px; display: flex; align-items: center; justify-content: center; }
+    .thm-avatar { width: 60px; height: 60px; background-image: url('${avatarDataUri}'); background-size: cover; background-position: center; border-radius: 50%; background-color: #121212; box-shadow: 0 0 3px 0 #303030; }
+    .badge-user-details { display: flex; flex-direction: column; gap: 8px; }
+    .title-wrapper { display: flex; align-items: center; gap: 6px; }
+    .user_name { font-weight: 500; font-size: 14px; color: #f9f9fb; max-width: 135px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+    .rank-title { font-weight: 500; font-size: 12px; color: #ffffff; }
+    .details-wrapper { display: flex; gap: 8px; }
+    .details-icon-wrapper { display: flex; gap: 4px; align-items: center; }
+    .details-icon-wrapper img { flex-shrink: 0; height: 16px; opacity: 0.85; }
+    .details-text { font-weight: 400; font-size: 11px; color: #ffffff; }
+    .thm-link { font-weight: 400; font-size: 11px; color: #f9f9fb; text-decoration: none; }
   </style>
 </head>
-
 <body>
-
   <div id="thm-badge">
-
-    <div class="thm-avatar-outer">
-      <div class="thm-avatar"></div>
-    </div>
-
-
+    <div class="thm-avatar-outer"><div class="thm-avatar"></div></div>
     <div class="badge-user-details">
-
       <div class="title-wrapper">
-
-        <span class="user_name">
-          ${escapeHTML(stats.username)}
-        </span>
-
-        <div>
-
-          <i
-            class="fa-solid fa-bolt-lightning rank-icon"
-          ></i>
-
-          <span class="rank-title">
-            ${escapeHTML(stats.rankTitle)}
-          </span>
-
-        </div>
-
+        <span class="user_name">${stats.username}</span>
+        <span class="rank-title">${stats.rankTitle}</span>
       </div>
-
-
       <div class="details-wrapper">
-
-        <div class="details-icon-wrapper">
-
-          <i
-            class="fa-solid fa-trophy detail-icons trophy-icon"
-          ></i>
-
-          <span class="details-text">
-            ${escapeHTML(stats.points)}
-          </span>
-
-        </div>
-
-
-        <div class="details-icon-wrapper">
-
-          <i
-            class="fa-solid fa-fire detail-icons fire-icon"
-          ></i>
-
-          <span class="details-text">
-            ${escapeHTML(stats.streak)}
-          </span>
-
-        </div>
-
-
-        <div class="details-icon-wrapper">
-
-          <i
-            class="fa-solid fa-award detail-icons award-icon"
-          ></i>
-
-          <span class="details-text">
-            ${escapeHTML(stats.rank)}
-          </span>
-
-        </div>
-
-
-        <div class="details-icon-wrapper">
-
-          <i
-            class="fa-solid fa-door-closed detail-icons door-closed-icon"
-          ></i>
-
-          <span class="details-text">
-            ${escapeHTML(stats.rooms)}
-          </span>
-
-        </div>
-
+        <div class="details-icon-wrapper"><img src="${iconTrophyUri}" alt="trophy" /><span class="details-text">${stats.points}</span></div>
+        <div class="details-icon-wrapper"><img src="${iconDoorUri}" alt="door" /><span class="details-text">${stats.rooms}</span></div>
+        <div class="details-icon-wrapper"><img src="${iconTargetUri}" alt="target" /><span class="details-text">${stats.rank}</span></div>
       </div>
-
-
-      <a
-        href="${PROFILE_URL}"
-        class="thm-link"
-        target="_blank"
-      >
-        tryhackme.com
-      </a>
-
+      <a href="https://tryhackme.com" class="thm-link" target="_blank">tryhackme.com</a>
     </div>
-
   </div>
-
 </body>
-</html>
-`;
+</html>`;
 }
 
-
-// ============================================================
-// HTML ESCAPING
-// ============================================================
-
-function escapeHTML(value) {
-  return String(
-    value ?? ''
-  )
-    .replace(
-      /&/g,
-      '&amp;'
-    )
-    .replace(
-      /</g,
-      '&lt;'
-    )
-    .replace(
-      />/g,
-      '&gt;'
-    )
-    .replace(
-      /"/g,
-      '&quot;'
-    )
-    .replace(
-      /'/g,
-      '&#039;'
-    );
-}
-
-
-// ============================================================
-// SCREENSHOT BADGE
-// ============================================================
-
-async function takeScreenshot(
-  html
-) {
-  /*
-   * Make sure assets directory exists.
-   */
-  fs.mkdirSync(
-    path.dirname(
-      OUTPUT_PATH
-    ),
-    {
-      recursive: true,
-    }
-  );
-
-  const browser =
-    await launchBrowser();
-
-  const page =
-    await browser.newPage();
-
+// ─── Screenshot ─────────────────────────────────────────────────────
+async function takeScreenshot(html) {
+  const browser = await puppeteer.launch(getLaunchOptions());
   try {
-    await page.setViewport({
-      width: 329,
-      height: 88,
-
-      deviceScaleFactor: 1,
-    });
-
-    await page.setContent(
-      html,
-      {
-        waitUntil:
-          'networkidle0',
-
-        timeout:
-          120000,
-      }
-    );
-
-    await page.waitForSelector(
-      '#thm-badge',
-      {
-        timeout:
-          30000,
-      }
-    );
-
-    /*
-     * Wait for fonts if possible.
-     */
-    await page.evaluate(
-      async () => {
-        if (
-          document.fonts &&
-          document.fonts.ready
-        ) {
-          await document.fonts.ready;
-        }
-      }
-    );
-
-    await sleep(1000);
-
-    await page.screenshot({
-      path:
-        OUTPUT_PATH,
-
-      omitBackground:
-        true,
-
-      type:
-        'png',
-    });
+    const page = await browser.newPage();
+    await page.setViewport({ width: 329, height: 88 });
+    await page.setContent(html, { waitUntil: 'domcontentloaded' });
+    // Wait a bit for any remaining layout
+    await new Promise(resolve => setTimeout(resolve, 500));
+    await page.screenshot({ path: OUTPUT_PATH, omitBackground: true });
   } finally {
-    await browser.close();
+    try { await browser.close(); } catch {}
   }
 }
 
-
-// ============================================================
-// HELPER
-// ============================================================
-
-function sleep(ms) {
-  return new Promise(
-    resolve =>
-      setTimeout(
-        resolve,
-        ms
-      )
-  );
-}
-
-
-// ============================================================
-// MAIN
-// ============================================================
-
+// ─── Main ───────────────────────────────────────────────────────────
 async function main() {
   try {
-    console.log(
-      'Fetching stats...'
-    );
+    if (DEBUG) console.log('[DEBUG] Mode enabled — saving raw HTML to debug/');
 
-    console.log(
-      `ScraperAPI enabled: ${USE_SCRAPERAPI}`
-    );
+    const html = await fetchBadgeHTML();
 
+    // Extract username, rankTitle, avatarUrl from badge HTML
+    const nicknameMatch = html.match(/<span class="thm_nickname">([^<]+)<\/span>/);
+    const username = nicknameMatch ? nicknameMatch[1] : 'virtualISP';
 
-    // --------------------------------------------------------
-    // Fetch badge
-    // --------------------------------------------------------
+    const rankMatch = html.match(/<span class="thm_rank">([^<]+)<\/span\s*>/);
+    const rankTitle = rankMatch ? rankMatch[1] : '[0xE]';
 
-    const html =
-      await fetchBadgeHTML();
-
-
-    // --------------------------------------------------------
-    // Fetch streak
-    // --------------------------------------------------------
-
-    const streak =
-      await fetchStreak();
-
-    console.log(
-      'Final streak:',
-      streak
-    );
-
-
-    // --------------------------------------------------------
-    // Extract stats
-    // --------------------------------------------------------
-
-    const stats =
-      extractStats(
-        html,
-        streak
-      );
-
-    console.log(
-      'Stats extracted:',
-      stats
-    );
-
-
-    // --------------------------------------------------------
-    // Generate badge
-    // --------------------------------------------------------
-
-    const badgeHTML =
-      await buildHTML(
-        stats
-      );
-
-
-    // --------------------------------------------------------
-    // Screenshot with retries
-    // --------------------------------------------------------
-
-    let screenshotSuccess =
-      false;
-
-    for (
-      let attempt = 1;
-      attempt <= 3;
-      attempt++
-    ) {
-      try {
-        console.log(
-          `Screenshot attempt ${attempt}...`
-        );
-
-        await takeScreenshot(
-          badgeHTML
-        );
-
-        console.log(
-          `Badge screenshot saved to ${OUTPUT_PATH}`
-        );
-
-        screenshotSuccess =
-          true;
-
-        break;
-      } catch (error) {
-        console.log(
-          `Screenshot attempt ${attempt} failed:`,
-          error.message
-        );
-
-        if (attempt < 3) {
-          await sleep(3000);
-        }
+    let avatarUrl = null;
+    const avatarMatch = html.match(/class="thm_avatar"[^>]*style="[^"]*background-image:\s*url\(['"]?([^'")]+)['"]?\)/);
+    if (avatarMatch) {
+      avatarUrl = avatarMatch[1];
+      if (avatarUrl.startsWith('user-avatars/')) {
+        avatarUrl = 'https://tryhackme-images.s3.amazonaws.com/' + avatarUrl;
       }
     }
-
-
-    if (!screenshotSuccess) {
-      throw new Error(
-        'All screenshot attempts failed'
-      );
+    if (!avatarUrl) {
+      const anyUrlMatch = html.match(/user-avatars\/([^'")]+)/);
+      avatarUrl = anyUrlMatch ? 'https://tryhackme-images.s3.amazonaws.com/user-avatars/' + anyUrlMatch[1] : null;
+    }
+    if (!avatarUrl) {
+      avatarUrl = 'https://tryhackme-images.s3.amazonaws.com/user-avatars/9868455b210665b03783b489764e48df.png';
     }
 
-
-    console.log(
-      'TryHackMe badge generation completed successfully.'
-    );
-  } catch (error) {
-    console.error(
-      'Failed:',
-      error.message
-    );
-
-    if (error.stack) {
-      console.error(
-        error.stack
-      );
+    const statsArray = extractStatsFromBadgeHTML(html);
+    if (statsArray.length < 3) {
+      console.warn('Stats extraction failed. HTML length:', html.length);
+      console.warn('Has thm_nickname:', html.includes('thm_nickname'));
+      console.warn('Has thm_stat:', html.includes('thm_stat'));
+      throw new Error(`Expected at least 3 stats from badge, got ${statsArray.length}`);
     }
+    const [points, rooms, rank] = statsArray;
 
+    const stats = { username, rankTitle, avatarUrl, points, rank, rooms };
+
+    const badgeHTML = await buildHTML(stats);
+    await takeScreenshot(badgeHTML);
+
+    console.log('Badge generated successfully!');
+    console.log(`   Username: ${stats.username}`);
+    console.log(`   Points: ${stats.points}`);
+    console.log(`   Rank: ${stats.rank}`);
+    console.log(`   Rooms: ${stats.rooms}`);
+  } catch (err) {
+    console.error('Failed to generate badge:', err.message);
     process.exit(1);
   }
 }
-
-
-// ============================================================
-// START
-// ============================================================
 
 main();
